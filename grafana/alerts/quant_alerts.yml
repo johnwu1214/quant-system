@@ -1,0 +1,89 @@
+groups:
+  - name: quant_system_alerts
+    interval: 30s
+    rules:
+      # 组合价值下跌告警
+      - alert: PortfolioValueDrop
+        expr: quant_portfolio_value{account="main"} < 90000
+        for: 5m
+        labels:
+          severity: critical
+          category: portfolio
+        annotations:
+          summary: "⚠️ 组合价值低于 ¥90,000"
+          description: "当前价值: {{ $value | printf \"%.2f\" }}"
+
+      # 仓位过重告警
+      - alert: PositionOverload
+        expr: sum(quant_position_weight) > 0.9
+        for: 3m
+        labels:
+          severity: warning
+          category: risk
+        annotations:
+          summary: "⚠️ 仓位过重 (>90%)"
+          description: "当前仓位: {{ $value | printf \"%.1f\" }}%"
+
+      # 风控拦截告警
+      - alert: RiskBlockedTrades
+        expr: increase(quant_risk_blocked_total[10m]) > 5
+        for: 2m
+        labels:
+          severity: warning
+          category: risk
+        annotations:
+          summary: "🚫 10分钟内超过5笔交易被风控拦截"
+
+      # VaR 超限告警
+      - alert: VaRExceeded
+        expr: quant_var_value{account="main"} > 5000
+        for: 5m
+        labels:
+          severity: warning
+          category: risk
+        annotations:
+          summary: "⚠️ VaR 超过 ¥5,000"
+          description: "当前 VaR: {{ $value | printf \"%.2f\" }}"
+
+      # 数据获取延迟告警
+      - alert: DataFetchLatency
+        expr: histogram_quantile(0.95, rate(quant_data_fetch_latency_seconds_bucket[5m])) > 5
+        for: 3m
+        labels:
+          severity: info
+          category: performance
+        annotations:
+          summary: "📡 数据获取延迟过高"
+          description: "P95 延迟: {{ $value | printf \"%.2f\" }}秒"
+
+      # CPU 使用率告警
+      - alert: HighCPUUsage
+        expr: quant_system_cpu_usage_percent > 80
+        for: 5m
+        labels:
+          severity: warning
+          category: system
+        annotations:
+          summary: "💻 CPU 使用率过高"
+          description: "当前: {{ $value | printf \"%.1f\" }}%"
+
+      # 内存使用告警
+      - alert: HighMemoryUsage
+        expr: quant_system_memory_mb > 2048
+        for: 5m
+        labels:
+          severity: warning
+          category: system
+        annotations:
+          summary: "💾 内存使用过高"
+          description: "当前: {{ $value | printf \"%.0f\" }}MB"
+
+      # 止损触发告警
+      - alert: StopLossTriggered
+        expr: quant_risk_checks_total{check_type="stop_loss", result="triggered"} > 0
+        for: 1m
+        labels:
+          severity: critical
+          category: risk
+        annotations:
+          summary: "🛑 止损触发!"

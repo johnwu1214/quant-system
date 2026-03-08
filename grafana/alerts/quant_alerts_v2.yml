@@ -1,0 +1,161 @@
+groups:
+  - name: quant_portfolio_alerts
+    interval: 30s
+    rules:
+      # 组合价值下跌告警
+      - alert: PortfolioValueDrop
+        expr: quant_portfolio_value{account="main"} < 90000
+        for: 5m
+        labels:
+          severity: critical
+          category: portfolio
+        annotations:
+          summary: "⚠️ 组合价值低于 ¥90,000"
+          description: "当前价值: {{ $value | printf \"%.2f\" }}"
+
+      # 仓位过重告警
+      - alert: PositionOverload
+        expr: sum(quant_position_weight) > 0.9
+        for: 3m
+        labels:
+          severity: warning
+          category: risk
+        annotations:
+          summary: "⚠️ 仓位过重 (>90%)"
+          description: "当前仓位: {{ $value | printf \"%.1f\" }}%"
+
+      # 大额亏损告警
+      - alert: LargeDailyLoss
+        expr: quant_unrealized_pnl < -10000
+        for: 5m
+        labels:
+          severity: critical
+          category: portfolio
+        annotations:
+          summary: "⚠️ 当日亏损超过 ¥10,000"
+
+  - name: quant_strategy_alerts
+    interval: 30s
+    rules:
+      # 信号执行失败告警
+      - alert: SignalExecutionFailed
+        expr: increase(quant_signals_executed_total{result="failed"}[10m]) > 5
+        for: 2m
+        labels:
+          severity: warning
+          category: strategy
+        annotations:
+          summary: "📡 信号执行失败过多"
+
+      # 胜率过低告警
+      - alert: LowWinRate
+        expr: (sum(quant_signals_executed_total{result="success"}) / sum(quant_signals_executed_total)) < 0.3
+        for: 30m
+        labels:
+          severity: warning
+          category: strategy
+        annotations:
+          summary: "📉 策略胜率低于30%"
+
+  - name: quant_risk_alerts
+    interval: 30s
+    rules:
+      # 风控拦截告警
+      - alert: RiskBlockedTrades
+        expr: increase(quant_risk_blocked_total[10m]) > 5
+        for: 2m
+        labels:
+          severity: warning
+          category: risk
+        annotations:
+          summary: "🚫 10分钟内超过5笔交易被风控拦截"
+
+      # VaR 超限告警
+      - alert: VaRExceeded
+        expr: quant_var_value{account="main"} > 5000
+        for: 5m
+        labels:
+          severity: warning
+          category: risk
+        annotations:
+          summary: "⚠️ VaR 超过 ¥5,000"
+          description: "当前 VaR: {{ $value | printf \"%.2f\" }}"
+
+      # 止损触发告警
+      - alert: StopLossTriggered
+        expr: quant_risk_checks_total{check_type="stop_loss", result="triggered"} > 0
+        for: 1m
+        labels:
+          severity: critical
+          category: risk
+        annotations:
+          summary: "🛑 止损触发!"
+
+      # 仓位集中度告警
+      - alert: HighConcentration
+        expr: max(quant_position_weight) > 0.4
+        for: 10m
+        labels:
+          severity: warning
+          category: risk
+        annotations:
+          summary: "⚠️ 单票仓位超过40%"
+
+  - name: quant_performance_alerts
+    interval: 30s
+    rules:
+      # 数据获取延迟告警
+      - alert: DataFetchLatency
+        expr: histogram_quantile(0.95, rate(quant_data_fetch_latency_seconds_bucket[5m])) > 5
+        for: 3m
+        labels:
+          severity: info
+          category: performance
+        annotations:
+          summary: "📡 数据获取延迟过高"
+          description: "P95 延迟: {{ $value | printf \"%.2f\" }}秒"
+
+      # 执行时间过长告警
+      - alert: HighExecutionTime
+        expr: histogram_quantile(0.95, rate(quant_execution_duration_seconds_bucket[5m])) > 30
+        for: 5m
+        labels:
+          severity: warning
+          category: performance
+        annotations:
+          summary: "⏱️ 执行时间过长"
+
+  - name: quant_system_alerts
+    interval: 30s
+    rules:
+      # CPU 使用率告警
+      - alert: HighCPUUsage
+        expr: quant_system_cpu_usage_percent > 80
+        for: 5m
+        labels:
+          severity: warning
+          category: system
+        annotations:
+          summary: "💻 CPU 使用率过高"
+          description: "当前: {{ $value | printf \"%.1f\" }}%"
+
+      # 内存使用告警
+      - alert: HighMemoryUsage
+        expr: quant_system_memory_mb > 2048
+        for: 5m
+        labels:
+          severity: warning
+          category: system
+        annotations:
+          summary: "💾 内存使用过高"
+          description: "当前: {{ $value | printf \"%.0f\" }}MB"
+
+      # API 错误告警
+      - alert: HighErrorRate
+        expr: rate(quant_error_total[5m]) > 0.1
+        for: 2m
+        labels:
+          severity: critical
+          category: system
+        annotations:
+          summary: "❌ 错误率过高"
