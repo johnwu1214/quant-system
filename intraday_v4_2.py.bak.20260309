@@ -279,39 +279,6 @@ def run_cycle(state, cycle_num):
         if sig['has_conflict']:
             print(f"    ⚡ {sig['conflict_desc']}")
     
-    # ══════════════════════════════════════
-    # 止损止盈检查（优先级高于信号判断）
-    # ══════════════════════════════════════
-    print(f"\n🛡️ 风控检查:")
-    try:
-        from risk_manager import RiskManager
-        rm = RiskManager()
-        positions = state['positions']
-        for code, pos in list(positions.items()):
-            if pos['shares'] <= 0:
-                continue
-            if code not in prices:
-                continue
-            current = prices[code]['price']
-            cost = pos['cost']
-            shares = pos['shares']
-            risk = rm.monitor_position(code, current, cost, shares)
-            pnl = risk['pnl_pct']
-            for action in risk.get('actions', []):
-                if action['action'] in ['止损', '止盈']:
-                    remove_position(state, code, current)
-                    emoji = '🔴' if action['action'] == '止损' else '🟢'
-                    print(f"   {emoji} {action['action']} {code}: {pnl:.1%} → 强制卖出 @ ¥{current}")
-                    print(f"      原因: {action['reason']}")
-                    break
-            else:
-                if risk['level'] == 'warning':
-                    print(f"   ⚠️  {code}: 浮亏 {pnl:.1%} 接近止损线，注意观察")
-                else:
-                    print(f"   ✅ {code}: 盈亏 {pnl:.1%} 正常")
-    except Exception as e:
-        print(f"   ⚠️ 风控检查失败: {e}")
-
     # 执行交易
     print(f"\n💰 交易执行:")
     
