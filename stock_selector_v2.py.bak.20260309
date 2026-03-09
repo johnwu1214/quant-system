@@ -428,18 +428,6 @@ def run_selector():
               f"{s['score']:<6} {s['reason'][:35]}")
         watch_codes.append(s['code'])
 
-    # 合并持仓股（持仓股必须在监控列表）
-    try:
-        with open('portfolio_state.json') as f:
-            port = json.load(f)
-        held = list(port.get('positions', {}).keys())
-        for code in held:
-            if code not in watch_codes:
-                watch_codes.insert(0, code)
-        print(f'📌 持仓股已合并: {held}')
-    except Exception as e:
-        print(f'⚠️ 持仓合并失败: {e}')
-
     # 第六步：保存结果
     output = {
         'date': datetime.now().strftime('%Y-%m-%d'),
