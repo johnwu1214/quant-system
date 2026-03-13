@@ -1,59 +1,23 @@
-# 敏感配置
+# 敏感配置（绝对不能上传）
 config.json
-*.env
-*.env.*
+portfolio_state.json
+*.pem
+*.key
 
-# Python
+# 数据文件
+fundamental_cache.json
+*.lock
+
+# 日志
+logs/
+*.log
+
+# Python缓存
 __pycache__/
 *.pyc
 *.pyo
-*.pyd
-.Python
-*.so
-*.egg
-*.egg-info/
-dist/
-build/
-
-# 整个 data 目录（本地生成）
-data/
-
-# 整个 logs 目录
-logs/
-
-# 日志文件
-*.log
-intraday_log.txt
-trading_log_*.txt
-continuous_trading.log
-streamlit.log
-
-# JSON 状态文件（本地生成）
-portfolio_state.json
-watch_list.json
-test_*.json
-test_log_*.json
-
-# Streamlit
-.streamlit/
-
-# 测试
-.pytest_cache/
-.coverage
-htmlcov/
-
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
 
 # 系统文件
 .DS_Store
-Thumbs.db
-
-# 文档（可选，看需求）
-*.md
-!SYSTEM_GUIDE.md
-*.bak.*
+*.tmp
 *.bak

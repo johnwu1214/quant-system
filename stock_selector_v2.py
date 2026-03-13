@@ -451,6 +451,9 @@ def run_selector():
         'details': selected
     }
 
+    if not watch_codes:
+        print('⚠️ 选股为空，不覆盖watch_list.json')
+        return []
     with open(WATCH_FILE, 'w', encoding='utf-8') as f:
         json.dump(output, f, ensure_ascii=False, indent=2)
 

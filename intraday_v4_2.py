@@ -37,6 +37,24 @@ def load_watch_list():
         with open('watch_list.json', 'r') as f:
             data = json.load(f)
         
+        # 容错：如果文件被写成列表格式，自动修复
+        if isinstance(data, list):
+            print("⚠️ watch_list.json 格式异常(列表)，自动修复为对象格式")
+            wl = data if data else ['002737', '603960', '601006', '600329', '601116']
+            fixed = {
+                "date": datetime.now().strftime('%Y-%m-%d'),
+                "updated_at": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                "market_regime": "neutral",
+                "mode": "🐟 震荡市-超卖反弹模式",
+                "watch_list": wl,
+                "details": []
+            }
+            with open('watch_list.json', 'w', encoding='utf-8') as fw:
+                import json as _json
+                _json.dump(fixed, fw, ensure_ascii=False, indent=2)
+            print(f"✅ 已自动修复 watch_list.json，股票池: {wl}")
+            data = fixed
+
         date = data.get('date', '未知')
         mode = data.get('mode', '未知模式')
         wl = data.get('watch_list', [])
