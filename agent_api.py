@@ -1,237 +1,141 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-quant Agent 数据接口层
-只读接口，供 OpenClaw quant Agent Skills 调用
-用法: python3 agent_api.py <action>
+agent_api.py - Quant Agent 指令接口
+用法: python3 agent_api.py <action> [args]
 """
-import json
-import sys
-import argparse
+import json, sys, os
 from datetime import datetime, date
-import os
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+PORTFOLIO_FILE = os.path.join(BASE_DIR, "portfolio_state.json")
 
 def load_portfolio():
-    with open(f'{BASE_DIR}/portfolio_state.json') as f:
+    with open(PORTFOLIO_FILE, encoding="utf-8") as f:
         return json.load(f)
 
-def load_watchlist():
-    with open(f'{BASE_DIR}/watch_list.json') as f:
-        return json.load(f)
+def cmd_portfolio():
+    """显示持仓"""
+    s = load_portfolio()
+    pos = s.get("positions", {})
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    print(f"===== 持仓状态 {now} =====")
+    if not pos:
+        print("当前无持仓")
+    else:
+        total_cost = 0
+        total_val  = 0
+        for code, v in pos.items():
+            shares  = v.get("shares", 0)
+            cost    = v.get("cost", 0)
+            cur     = v.get("current_price", cost)
+            pnl     = (cur - cost) * shares
+            pnl_pct = (cur - cost) / cost * 100 if cost else 0
+            status  = "盈利" if pnl >= 0 else "亏损"
+            total_cost += cost * shares
+            total_val  += cur * shares
+            print(f"{code}: {shares}股 成本{cost:.3f} 现价{cur:.2f} {status}{abs(pnl):.2f}({pnl_pct:+.2f}%)")
+    print(f"现金: {s.get('cash', 0):.2f}")
+    positions_val = sum(v.get("current_price", v.get("cost", 0)) * v.get("shares", 0)
+                        for v in pos.values())
+    print(f"总资产: {s.get('cash', 0) + positions_val:.2f}")
 
-# ══════════════════════════════════════
-# 1. 持仓查询
-# ══════════════════════════════════════
-def get_portfolio():
-    state = load_portfolio()
-    positions = state.get('positions', {})
-    cash = state.get('cash', 0)
+def cmd_pnl():
+    """今日盈亏"""
+    s   = load_portfolio()
+    log = s.get("trade_log", [])
+    today = date.today().strftime("%Y-%m-%d")
+    trades = [t for t in log if t.get("time", "").startswith(today)]
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    print(f"===== 今日交易 {now} =====")
+    if not trades:
+        print("今日暂无交易记录")
+        return
+    total_pnl = 0
+    for t in trades:
+        action = t.get("action", "")
+        code   = t.get("symbol") or t.get("code", "")
+        price  = t.get("price", 0)
+        shares = t.get("shares", 0)
+        pnl    = t.get("pnl", 0)
+        reason = t.get("reason", "")
+        if action == "BUY":
+            print(f"买入 {code}: {shares}股 @ {price:.2f}")
+        elif action == "SELL":
+            status = "盈" if pnl >= 0 else "亏"
+            print(f"卖出 {code}: {shares}股 @ {price:.2f} {status}{abs(pnl):.2f} {reason}")
+            total_pnl += pnl
+    if total_pnl != 0:
+        status = "盈利" if total_pnl >= 0 else "亏损"
+        print(f"今日已实现{status}: {total_pnl:+.2f}")
 
-    pos_list = []
-    total_cost = 0
-    for code, pos in positions.items():
-        cost_total = pos['shares'] * pos['cost']
-        total_cost += cost_total
-        pos_list.append({
-            "code": code,
-            "shares": pos['shares'],
-            "cost": round(pos['cost'], 3),
-            "cost_total": round(cost_total, 2)
-        })
+def cmd_risk():
+    """止损检查"""
+    sys.path.insert(0, BASE_DIR)
+    import risk_manager_v2
+    alerts = risk_manager_v2.check_all_positions(send_alert=False)
+    if not alerts:
+        print("所有持仓风控正常，未触发止损")
+    else:
+        for a in alerts:
+            print(f"警告 {a['code']}: 现价{a['current']} 止损价{a['stop_price']} 亏损{a['loss']:.2f}")
 
-    total_assets = cash + total_cost
-    position_ratio = round(total_cost / total_assets * 100, 1) if total_assets > 0 else 0
-
-    return {
-        "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-        "cash": round(cash, 2),
-        "positions": pos_list,
-        "position_count": len(pos_list),
-        "total_cost": round(total_cost, 2),
-        "total_assets": round(total_assets, 2),
-        "position_ratio": f"{position_ratio}%",
-        "cash_ratio": f"{round(100 - position_ratio, 1)}%"
-    }
-
-# ══════════════════════════════════════
-# 2. 今日交易信号
-# ══════════════════════════════════════
-def get_signals():
-    today = date.today().strftime('%Y%m%d')
-    log_file = f'{BASE_DIR}/logs/trading_{today}.log'
-    signals = []
-    summary = []
-
-    try:
-        with open(log_file) as f:
-            for line in f:
-                line = line.strip()
-                if any(k in line for k in ['BUY', 'SELL', '买入', '卖出', '止损', '止盈']):
-                    signals.append(line)
-                if any(k in line for k in ['总资产', '现金', '持仓', '盈亏']):
-                    summary.append(line)
-    except FileNotFoundError:
-        signals = ["今日交易日志暂未生成"]
-
-    return {
-        "date": str(date.today()),
-        "signals": signals[-20:],  # 最近20条
-        "summary": summary[-5:]
-    }
-
-# ══════════════════════════════════════
-# 3. 风险状态
-# ══════════════════════════════════════
-def get_risk():
-    state = load_portfolio()
-    positions = state.get('positions', {})
-    cash = state.get('cash', 0)
-
-    STOP_LOSS = -0.08
-    TAKE_PROFIT = 0.15
-    WARNING_LINE = -0.05
-
-    alerts = []
-    warnings = []
-    normal = []
-
-    total_cost = sum(p['shares'] * p['cost'] for p in positions.values())
-    total_assets = cash + total_cost
-    position_ratio = total_cost / total_assets if total_assets > 0 else 0
-
-    for code, pos in positions.items():
-        cost = pos['cost']
-        shares = pos['shares']
-        cost_total = shares * cost
-        weight = cost_total / total_assets if total_assets > 0 else 0
-
-        item = {
-            "code": code,
-            "shares": shares,
-            "cost": cost,
-            "weight": f"{round(weight*100, 1)}%",
-            "note": "需实时行情计算盈亏"
-        }
-
-        if weight > 0.15:
-            alerts.append({**item, "level": "⚠️ 单股占比过高"})
+def cmd_blacklist(args):
+    """黑名单管理"""
+    sys.path.insert(0, BASE_DIR)
+    import blacklist_manager
+    if len(args) >= 2 and args[0] == "add":
+        code = args[1]
+        reason = " ".join(args[2:]) if len(args) > 2 else "手动加入"
+        blacklist_manager.add(code, reason=reason, days=30)
+    elif len(args) >= 2 and args[0] == "remove":
+        blacklist_manager.remove(args[1])
+    elif args[0] == "list":
+        bl = blacklist_manager.list_all()
+        if not bl:
+            print("黑名单为空")
         else:
-            normal.append({**item, "level": "✅ 正常"})
+            print(f"===== 黑名单 ({len(bl)}只) =====")
+            for code, info in bl.items():
+                print(f"{code}: {info.get('reason','')} 到期{info.get('expire_at','')}")
+    else:
+        print("用法: blacklist add/remove/list [code]")
 
-    risk_level = "🔴 高风险" if alerts else "🟡 注意" if warnings else "🟢 正常"
+def cmd_status():
+    """系统状态"""
+    import subprocess
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    print(f"===== 系统状态 {now} =====")
+    r = subprocess.run("ps aux | grep -E 'intraday|openclaw' | grep -v grep",
+                       shell=True, capture_output=True, text=True)
+    procs = r.stdout.strip()
+    if procs:
+        for line in procs.split("\n"):
+            parts = line.split()
+            if len(parts) > 10:
+                print(f"运行中: {parts[10]} PID:{parts[1]}")
+    else:
+        print("交易程序未运行")
+    s = load_portfolio()
+    pos = s.get("positions", {})
+    print(f"持仓数量: {len(pos)} 只")
+    print(f"现金余额: {s.get('cash', 0):.2f}")
 
-    return {
-        "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-        "risk_level": risk_level,
-        "position_ratio": f"{round(position_ratio*100, 1)}%",
-        "alerts": alerts,
-        "warnings": warnings,
-        "normal": normal,
-        "thresholds": {
-            "stop_loss": f"{int(STOP_LOSS*100)}%",
-            "take_profit": f"{int(TAKE_PROFIT*100)}%",
-            "warning": f"{int(WARNING_LINE*100)}%"
-        }
-    }
-
-# ══════════════════════════════════════
-# 4. 监控列表
-# ══════════════════════════════════════
-def get_watchlist():
-    try:
-        data = load_watchlist()
-        if isinstance(data, list):
-            return {"date": str(date.today()), "mode": "未知", "watch_list": data}
-        return {
-            "date": data.get('date', ''),
-            "mode": data.get('mode', ''),
-            "market_regime": data.get('market_regime', ''),
-            "watch_list": data.get('watch_list', []),
-            "count": len(data.get('watch_list', []))
-        }
-    except Exception as e:
-        return {"error": str(e)}
-
-# ══════════════════════════════════════
-# 5. 系统健康检查
-# ══════════════════════════════════════
-def get_health():
-    checks = {}
-
-    # 检查核心文件
-    files = {
-        "portfolio_state.json": f'{BASE_DIR}/portfolio_state.json',
-        "watch_list.json": f'{BASE_DIR}/watch_list.json',
-        "intraday_v4_2.py": f'{BASE_DIR}/intraday_v4_2.py',
-        "stock_selector_v2.py": f'{BASE_DIR}/stock_selector_v2.py',
-    }
-    for name, path in files.items():
-        checks[name] = "✅ 存在" if os.path.exists(path) else "❌ 缺失"
-
-    # 检查今日日志
-    today = date.today().strftime('%Y%m%d')
-    log_file = f'{BASE_DIR}/logs/trading_{today}.log'
-    checks["今日交易日志"] = "✅ 已生成" if os.path.exists(log_file) else "⚠️ 未生成"
-
-    # 检查选股日志
-    selector_log = f'{BASE_DIR}/logs/selector_{today}.log'
-    checks["今日选股日志"] = "✅ 已生成" if os.path.exists(selector_log) else "⚠️ 未生成"
-
-    # 读取最后更新时间
-    try:
-        state = load_portfolio()
-        last_update = state.get('updated_at', '未知')
-    except:
-        last_update = "读取失败"
-
-    return {
-        "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-        "files": checks,
-        "portfolio_last_update": last_update,
-        "status": "✅ 系统正常" if all("✅" in v for v in list(checks.values())[:4]) else "⚠️ 需要检查"
-    }
-
-# ══════════════════════════════════════
-# 6. 交易历史摘要
-# ══════════════════════════════════════
-def get_history():
-    state = load_portfolio()
-    trade_log = state.get('trade_log', [])
-
-    buy_count = sum(1 for t in trade_log if t['action'] == 'BUY')
-    sell_count = sum(1 for t in trade_log if t['action'] == 'SELL')
-    total_pnl = sum(t.get('pnl', 0) for t in trade_log if t['action'] == 'SELL')
-
-    return {
-        "total_trades": len(trade_log),
-        "buy_count": buy_count,
-        "sell_count": sell_count,
-        "total_realized_pnl": round(total_pnl, 2),
-        "recent_trades": trade_log[-5:],
-        "created_at": state.get('created_at', ''),
-        "updated_at": state.get('updated_at', '')
-    }
-
-# ══════════════════════════════════════
-# 主入口
-# ══════════════════════════════════════
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='quant Agent 数据接口')
-    parser.add_argument('action', choices=[
-        'portfolio', 'signals', 'risk', 'watchlist', 'health', 'history'
-    ], help='查询类型')
-    args = parser.parse_args()
-
-    actions = {
-        'portfolio': get_portfolio,
-        'signals':   get_signals,
-        'risk':      get_risk,
-        'watchlist': get_watchlist,
-        'health':    get_health,
-        'history':   get_history,
-    }
-
-    result = actions[args.action]()
-    print(json.dumps(result, ensure_ascii=False, indent=2))
+    args = sys.argv[1:]
+    if not args:
+        print("用法: python3 agent_api.py <portfolio|pnl|risk|status|blacklist>")
+        sys.exit(0)
+    cmd = args[0]
+    if cmd == "portfolio":
+        cmd_portfolio()
+    elif cmd == "pnl":
+        cmd_pnl()
+    elif cmd == "risk":
+        cmd_risk()
+    elif cmd == "status":
+        cmd_status()
+    elif cmd == "blacklist":
+        cmd_blacklist(args[1:])
+    else:
+        print(f"未知指令: {cmd}")

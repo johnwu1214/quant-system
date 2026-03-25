@@ -31,7 +31,6 @@ DECISION_LOG   = os.path.join(BASE_DIR, "decision_log.jsonl")
 # 风控模块
 try:
     import blacklist_manager, risk_manager_v2
-    from enhanced_risk_manager import EnhancedRiskManager
     RISK_LOADED = True
     logger.info("风控模块加载成功")
 except ImportError as e:
@@ -70,38 +69,7 @@ _LAST_SIGNAL = {}
 # ══════════════════════════════════════════════════════
 # decision_log 记录
 # ══════════════════════════════════════════════════════
-def calculate_trade_cost(action, price, shares):
-    """计算交易成本（手续费+滑点）
-    action: 'BUY' 或 'SELL'
-    price: 基准价
-    shares: 股数
-    返回: {actual_price, commission, tax, total_cost}
-    """
-    MIN_COMMISSION = 5.0  # 最低手续费5元
-    commission_rate = 0.0003  # 万3
-    stamp_tax_rate = 0.001    # 千1（仅卖出）
-
-    if action == "BUY":
-        actual_price = round(price * 1.001, 3)   # 滑点+0.1%
-        gross = shares * actual_price
-        commission = max(round(gross * commission_rate, 2), MIN_COMMISSION)
-        tax = 0.0
-        total_cost = gross + commission
-    else:  # SELL
-        actual_price = round(price * 0.999, 3)   # 滑点-0.1%
-        gross = shares * actual_price
-        commission = max(round(gross * commission_rate, 2), MIN_COMMISSION)
-        tax = round(gross * stamp_tax_rate, 2)
-        total_cost = gross - commission - tax
-
-    return {
-        "actual_price": actual_price,
-        "commission": commission,
-        "tax": tax,
-        "total_cost": round(total_cost, 2)
-    }
-
-def log_decision(action, code, price, shares, score, reason, market, result="pending", commission=0.0, tax=0.0):
+def log_decision(action, code, price, shares, score, reason, market, result="pending"):
     """追加记录到 decision_log.jsonl"""
     try:
         record = {
@@ -113,9 +81,7 @@ def log_decision(action, code, price, shares, score, reason, market, result="pen
             "score": round(score, 1) if score else None,
             "reason": reason,
             "market": market,
-            "result": result,
-            "commission": round(commission, 2),
-            "tax": round(tax, 2)
+            "result": result
         }
         with open(DECISION_LOG, "a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -178,78 +144,58 @@ def load_portfolio():
 
 def save_portfolio(state):
     state["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    # 每次保存时自动更新净值和总资产
-    INITIAL_CAPITAL = 100000
-    cash = state.get("cash", 0)
-    pos_val = sum(
-        p.get("shares", 0) * p.get("current_price", p.get("cost", 0))
-        for p in state.get("positions", {}).values()
-    )
-    total = round(cash + pos_val, 2)
-    state["total_assets"] = total
-    state["net_value"]    = round(total / INITIAL_CAPITAL, 4)
     with open(PORTFOLIO_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
 
 def add_position(state, code, shares, price, score=0, reason="", market="unknown"):
-    """买入持仓（已包含手续费+滑点+decision_log记录）"""
-    cost_info = calculate_trade_cost("BUY", price, shares)
-    actual_price = cost_info["actual_price"]
-    amount = round(shares * actual_price, 2)
-    total_outlay = amount + cost_info["commission"]
-    if state["cash"] < total_outlay:
-        logger.warning(f"现金不足，无法买入 {code}（需{total_outlay}，可用{state['cash']}）")
+    """买入持仓（已包含decision_log记录）"""
+    amount = round(shares * price, 2)
+    if state["cash"] < amount:
+        logger.warning(f"现金不足，无法买入 {code}")
         return False
-    state["cash"] = round(state["cash"] - total_outlay, 2)
+    state["cash"] = round(state["cash"] - amount, 2)
     state.setdefault("positions", {})[code] = {
         "shares": shares,
-        "cost": round(actual_price, 3),
-        "current_price": actual_price,
-        "high_water_mark": actual_price,
+        "cost": round(price, 3),
+        "current_price": price,
+        "high_water_mark": price,  # 记录买入价为初始高点
         "entry_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     }
     state.setdefault("trades", []).append({
         "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "action": "BUY", "code": code,
-        "shares": shares, "price": actual_price,
-        "amount": amount, "commission": cost_info["commission"]
+        "shares": shares, "price": price, "amount": amount
     })
     save_portfolio(state)
-    log_decision("BUY", code, actual_price, shares, score, reason, market, "pending",
-                 commission=cost_info["commission"], tax=0.0)
-    logger.info(f"买入 {code}: {shares}股 @ {actual_price}（滑点+{price*0.001:.3f}），花费 {total_outlay}（手续费{cost_info['commission']}）")
+    # 记录decision_log
+    log_decision("BUY", code, price, shares, score, reason, market, "pending")
+    logger.info(f"买入 {code}: {shares}股 @ {price}，花费 {amount}")
     return True
 
 def remove_position(state, code, price, reason="信号卖出", result="pending"):
-    """卖出持仓（已包含手续费+滑点+印花税+decision_log记录）"""
+    """卖出持仓（已包含decision_log记录）"""
     pos = state.get("positions", {}).get(code)
     if not pos:
         return False
     shares = pos["shares"]
     cost   = pos["cost"]
-    cost_info = calculate_trade_cost("SELL", price, shares)
-    actual_price = cost_info["actual_price"]
-    net_proceeds = actual_price * shares - cost_info["commission"] - cost_info["tax"]
-    pnl = round(net_proceeds - cost * shares, 2)
-    pnl_pct = round((actual_price - cost) / cost * 100, 2)
-    state["cash"] = round(state["cash"] + net_proceeds, 2)
+    amount = round(shares * price, 2)
+    pnl    = round((price - cost) * shares, 2)
+    pnl_pct= round((price - cost) / cost * 100, 2)
+    state["cash"] = round(state["cash"] + amount, 2)
     del state["positions"][code]
     state.setdefault("trades", []).append({
         "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "action": "SELL", "code": code,
-        "shares": shares, "price": actual_price,
-        "amount": round(actual_price * shares, 2),
-        "commission": cost_info["commission"],
-        "tax": cost_info["tax"],
-        "net_proceeds": round(net_proceeds, 2),
-        "pnl": pnl,
+        "shares": shares, "price": price,
+        "amount": amount, "pnl": pnl,
         "pnl_pct": pnl_pct, "reason": reason
     })
     save_portfolio(state)
-    log_decision("SELL", code, actual_price, shares, 0, reason, "unknown", result,
-                 commission=cost_info["commission"], tax=cost_info["tax"])
+    # 记录decision_log
+    log_decision("SELL", code, price, shares, 0, reason, "unknown", result)
     emoji = "盈利" if pnl >= 0 else "亏损"
-    logger.info(f"卖出 {code}: {shares}股 @ {actual_price}（滑点-{price*0.001:.3f}），净收入 {net_proceeds}，{emoji} {pnl}（{pnl_pct}%）原因:{reason}")
+    logger.info(f"卖出 {code}: {shares}股 @ {price}，{emoji} {pnl}({pnl_pct}%) 原因:{reason}")
     return True
 
 # ══════════════════════════════════════════════════════
@@ -455,10 +401,10 @@ def get_atr_stop(code, entry_price, multiplier=3.0):
         return entry_price * 0.92
     tr_list = []
     for i in range(1, len(prices)):
-        # get_history_kline 返回收盘价列表，用相邻价差估算 TR
-        curr = float(prices[i])
-        prev = float(prices[i-1])
-        tr = abs(curr - prev)
+        high = float(prices[i]["high"])
+        low  = float(prices[i]["low"])
+        prev = float(prices[i-1]["close"])
+        tr = max(high - low, abs(high - prev), abs(low - prev))
         tr_list.append(tr)
     atr = np.mean(tr_list[-14:])
     stop = entry_price - multiplier * atr
@@ -474,36 +420,6 @@ def daily_check():
     today = datetime.now().strftime("%Y-%m-%d")
     logger.info(f"\n{'='*50}\n开始每日检查 {today}\n{'='*50}")
 
-    # 初始化增强版风控管理器
-    try:
-        from enhanced_risk_manager import EnhancedRiskManager
-        erm = EnhancedRiskManager()
-        cash = state.get('cash', 0)
-        positions = state.get('positions', {})
-        # 用实时价格计算总资产，避免旧 current_price 导致误判
-        pos_val = 0
-        for _code, _pos in positions.items():
-            _live = get_realtime_price(_code)
-            if isinstance(_live, dict):
-                _live = _live.get('price')
-            _px = _live if _live else _pos.get('current_price', _pos.get('cost', 0))
-            pos_val += _pos.get('shares', 0) * _px
-        total_val = cash + pos_val
-        erm.set_capital(100000)  # 初始资金10万为基准
-        erm.set_positions(positions)
-        # 账户级风控检查
-        erm.peak_value = max(erm.peak_value, 100000)  # 初始峰值=初始资金
-        acct_risk = erm.check_account_risk(total_val, pos_val)  # 传总资产+持仓市值
-        if not acct_risk['approved']:
-            for act in acct_risk.get('actions', []):
-                logger.warning(f"[账户风控] ⚠️ {act['action']}: {act['reason']}")
-        for w in acct_risk.get('warnings', []):
-            logger.info(f"[账户风控] 注意: {w}")
-        logger.info(f"[账户风控] 总资产¥{total_val:.0f} 账户风控{'✅通过' if acct_risk['approved'] else '❌触发'}")
-    except Exception as e:
-        logger.warning(f"[账户风控] 初始化失败: {e}")
-        erm = None
-
     # 初始化每日买入计数器（任务4修复）
     daily_buy_count = 0
 
@@ -517,8 +433,6 @@ def daily_check():
     for code in list(held):
         pos = state["positions"][code]
         price = get_realtime_price(code)
-        if isinstance(price, dict):
-            price = price.get('price')
         if price is None or price <= 0:
             logger.warning(f"[{code}] 无法获取价格，跳过")
             continue
@@ -530,23 +444,6 @@ def daily_check():
         cost = pos["cost"]
         pnl_pct = (price - cost) / cost * 100
         logger.info(f"[{code}] 现价:{price:.2f} 成本:{cost:.2f} 盈亏:{pnl_pct:.2f}%")
-
-        # 单股风控检查（第二层）
-        if erm:
-            try:
-                pos_risk = erm.check_position_risk(
-                    code=code, current_price=price,
-                    cost_price=cost, shares=pos.get('shares', 0)
-                )
-                if not pos_risk['approved']:
-                    for act in pos_risk.get('actions', []):
-                        logger.warning(f"[单股风控] {code} ⚠️ {act.get('action','')}: {act.get('reason','')}")
-                        if act.get('action') in ['止损', '强制卖出', '清仓']:
-                            reason = f"增强风控触发: {act.get('reason','')}"
-                            remove_position(state, code, price, reason=reason, result="enhanced_risk")
-                            continue
-            except Exception as e:
-                logger.debug(f"[单股风控] {code} 检查异常: {e}")
 
         # ── 移动止盈检查（任务1） ──
         trailing_triggered, trailing_reason = check_trailing_stop(state, code, price)
@@ -563,7 +460,7 @@ def daily_check():
             reason = f"止损: ATR/硬止损触发 现价{price:.2f}<=止损价{stop_price:.2f}"
             logger.info(f"[{code}] {reason}")
             remove_position(state, code, price, reason=reason, result="stop_loss")
-            # blacklist_manager.add_to_blacklist(code)  # 方法不存在，已跳过
+            blacklist_manager.add_to_blacklist(code)
             continue
 
         # ── 卖出信号检查 ──
@@ -571,7 +468,7 @@ def daily_check():
         if klines is None or len(klines) < MIN_KLINE_REQUIRED:
             logger.warning(f"[{code}] K线不足({len(klines) if klines else 0}根)，跳过")
             continue
-        prices_list = [float(k["close"]) if isinstance(k, dict) else float(k) for k in klines]
+        prices_list = [float(k["close"]) for k in klines]
         sig = compute_signal(code, prices_list, price)
         logger.info(f"[{code}] 信号评分={sig['score']} 信号={sig['signal']} 原因:{sig['reason']}")
         if sig["signal"] == "SELL" and sig["score"] <= SELL_THRESHOLD:
@@ -603,7 +500,7 @@ def daily_check():
             klines = get_history_kline(code)
             if klines is None or len(klines) < MIN_KLINE_REQUIRED:
                 continue
-            prices_list = [float(k["close"]) if isinstance(k, dict) else float(k) for k in klines]
+            prices_list = [float(k["close"]) for k in klines]
             sig = compute_signal(code, prices_list, price)
             candidates.append((code, price, sig))
 

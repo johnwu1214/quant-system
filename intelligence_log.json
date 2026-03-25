@@ -1,0 +1,69 @@
+{
+  "scan_date": "2026-03-25",
+  "scan_time": "2026-03-25 15:35",
+  "summary": {
+    "high_risk": [],
+    "medium_risk": [],
+    "normal": [
+      "600089",
+      "300394",
+      "300502"
+    ]
+  },
+  "details": {
+    "600089": {
+      "final_risk_level": "normal",
+      "announcement": {
+        "stock": "600089",
+        "risk_level": "normal",
+        "risk_keywords_hit": [],
+        "notice_count": 0,
+        "titles": [],
+        "error": null
+      },
+      "news": {
+        "stock": "600089",
+        "news_sentiment": "neutral",
+        "negative_headlines": [],
+        "error": "新闻接口无数据"
+      },
+      "scan_time": "2026-03-25 15:35"
+    },
+    "300394": {
+      "final_risk_level": "normal",
+      "announcement": {
+        "stock": "300394",
+        "risk_level": "normal",
+        "risk_keywords_hit": [],
+        "notice_count": 0,
+        "titles": [],
+        "error": null
+      },
+      "news": {
+        "stock": "300394",
+        "news_sentiment": "neutral",
+        "negative_headlines": [],
+        "error": "新闻接口无数据"
+      },
+      "scan_time": "2026-03-25 15:35"
+    },
+    "300502": {
+      "final_risk_level": "normal",
+      "announcement": {
+        "stock": "300502",
+        "risk_level": "normal",
+        "risk_keywords_hit": [],
+        "notice_count": 0,
+        "titles": [],
+        "error": null
+      },
+      "news": {
+        "stock": "300502",
+        "news_sentiment": "neutral",
+        "negative_headlines": [],
+        "error": "新闻接口无数据"
+      },
+      "scan_time": "2026-03-25 15:35"
+    }
+  }
+}

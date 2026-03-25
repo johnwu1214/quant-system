@@ -83,52 +83,88 @@ def calc_volatility(prices, period=20):
 
 def detect_market_regime():
     """
-    检测当前市场环境
+    检测当前市场环境 - 使用 BaoStock sh.000300 指数，零 Qlib 依赖
     返回：'bull'（牛市）/ 'neutral'（震荡）/ 'bear'（熊市）
+    判断逻辑：
+      牛市  = 20日收益>5% 且 MA5>MA20
+      熊市  = 20日收益<-5% 且 MA5<MA20
+      震荡市 = 其他
     """
-    import baostock as bs
     import numpy as np
+    import baostock as bs
     from datetime import datetime, timedelta
+
     try:
-        bs.login()
-        end = datetime.today().strftime('%Y-%m-%d')
-        start = (datetime.today() - timedelta(days=40)).strftime('%Y-%m-%d')
+        # 取过去 90 天数据，确保至少有 60 个交易日
+        end_date   = datetime.today().strftime('%Y-%m-%d')
+        start_date = (datetime.today() - timedelta(days=90)).strftime('%Y-%m-%d')
+
+        lg = bs.login()
         rs = bs.query_history_k_data_plus(
-            'sh.000001',
+            'sh.000300',
             'date,close',
-            start_date=start,
-            end_date=end,
-            frequency='d'
+            start_date=start_date,
+            end_date=end_date,
+            frequency='d',
+            adjustflag='3'
         )
-        df = rs.get_data()
+        rows = []
+        while rs.error_code == '0' and rs.next():
+            rows.append(rs.get_row_data())
         bs.logout()
-        df['close'] = df['close'].astype(float)
-        prices = df['close'].values
-        
-        if len(prices) < 20:
+
+        if not rows:
+            # BaoStock 也失败，尝试 mootdx 实时兜底
+            try:
+                import sys, os
+                sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+                from data_source import get_realtime_price_mootdx
+                r = get_realtime_price_mootdx('000300')
+                if r and r.get('price'):
+                    print('  ⚠️ BaoStock 指数无数据，使用实时价格估算，默认震荡市')
+                    return 'neutral', 0.0
+            except Exception:
+                pass
+            print('  ⚠️ 指数数据获取失败，默认震荡市')
             return 'neutral', 0.0
-        
-        returns = (prices[-1] - prices[-20]) / prices[-20]
-        ma5 = np.mean(prices[-5:])
-        ma20 = np.mean(prices[-20:])
-        trend = (ma5 - ma20) / ma20
-        
-        if returns > 0.05 and trend > 0.02:
-            return 'bull', returns
-        elif returns < -0.05 and trend < -0.02:
-            return 'bear', returns
+
+        # 提取收盘价序列（过滤空值）
+        prices = []
+        for row in rows:
+            try:
+                v = float(row[1])
+                if v > 0:
+                    prices.append(v)
+            except (ValueError, IndexError):
+                continue
+
+        if len(prices) < 25:
+            print(f'  ⚠️ 指数数据不足({len(prices)}条)，默认震荡市')
+            return 'neutral', 0.0
+
+        prices = np.array(prices)
+        ret20  = (prices[-1] - prices[-20]) / prices[-20]      # 20日收益率
+        ma5    = np.mean(prices[-5:])
+        ma20   = np.mean(prices[-20:])
+        ma60   = np.mean(prices[-60:]) if len(prices) >= 60 else ma20
+        trend  = (ma5 - ma20) / ma20                           # MA5/MA20 趋势
+        vol20  = np.std(np.diff(prices[-21:])) / np.mean(prices[-21:])  # 波动率
+
+        print(f'  20日收益: {ret20*100:+.2f}%  MA5/MA20趋势: {trend*100:+.2f}%  波动率: {vol20*100:.2f}%')
+
+        if ret20 > 0.05 and trend > 0.01:
+            regime = 'bull'
+        elif ret20 < -0.05 and trend < -0.01:
+            regime = 'bear'
         else:
-            return 'neutral', returns
-        
+            regime = 'neutral'
+
+        print(f'  市场判断: {regime}  (sh.000300 {len(prices)}条数据)')
+        return regime, ret20
+
     except Exception as e:
-        print(f"⚠️ 市场环境检测失败: {e}，默认震荡市")
+        print(f'  ⚠️ 市场状态检测异常: {e}，默认震荡市')
         return 'neutral', 0.0
-
-
-# ════════════════════════════════════════
-# 第三模块：三模式评分引擎
-# ════════════════════════════════════════
-
 def score_bull_mode(prices, current):
     """
     牛市模式：趋势追踪
@@ -295,25 +331,26 @@ def run_selector():
     }[regime]
     print(f"\n✅ 当前模式: {mode_name}\n")
 
-    # 第二步：获取全市场股票列表
-    print("【第二步】获取全市场股票列表...")
+
+    # 第二步：获取沪深300成分股（BaoStock，完全免费）
+    print("【第二步】获取沪深300成分股...")
     try:
-        stocks = pro.stock_basic(
-            exchange='',
-            list_status='L',
-            fields='ts_code,symbol,name,industry,list_date'
-        )
-        # 过滤
-        stocks = stocks[~stocks['name'].str.contains('ST|退', na=False)]
-        stocks = stocks[~stocks['ts_code'].str.startswith('688')]
-        stocks = stocks[~stocks['ts_code'].str.startswith('8')]
-        stocks = stocks[~stocks['ts_code'].str.startswith('4')]
-
-        # 过滤上市不足6个月的新股
-        cutoff = (datetime.today() - timedelta(days=180)).strftime('%Y%m%d')
-        stocks = stocks[stocks['list_date'] <= cutoff]
-
-        print(f"✅ 候选股票: {len(stocks)} 只")
+        import baostock as bs
+        import pandas as pd
+        bs.login()
+        rs = bs.query_hs300_stocks()
+        rows = []
+        while rs.error_code == '0' and rs.next():
+            r = rs.get_row_data()
+            code6 = r[1].split('.')[1] if '.' in r[1] else r[1]
+            if code6.startswith('688') or code6.startswith('8') or code6.startswith('4'):
+                continue
+            rows.append({'ts_code': code6, 'name': r[2]})
+        bs.logout()
+        if not rows:
+            raise Exception("BaoStock 返回为空")
+        stocks = pd.DataFrame(rows)
+        print(f"✅ 候选股票(沪深300): {len(stocks)} 只")
     except Exception as e:
         print(f"❌ 获取股票列表失败: {e}")
         return []
@@ -328,22 +365,38 @@ def run_selector():
     total = len(stocks)
     errors = 0
 
+    # BaoStock 循环外一次登录，避免反复握手卡死
+    import baostock as bs
+    bs.login()
+    end_bs   = datetime.today().strftime('%Y-%m-%d')
+    start_bs = (datetime.today() - timedelta(days=180)).strftime('%Y-%m-%d')
+
     for i, row in stocks.iterrows():
-        ts_code = row['ts_code']
-        name = row['name']
+        ts_code = row['ts_code']   # 6位代码，如 300502
+        name    = row['name']
+        bs_code = ('sh.' if ts_code.startswith('6') else 'sz.') + ts_code
 
         try:
-            df = pro.daily(
-                ts_code=ts_code,
-                start_date=start,
-                end_date=end,
-                fields='trade_date,close,vol,amount'
+            rs2 = bs.query_history_k_data_plus(
+                bs_code,
+                'date,close,volume,amount',
+                start_date=start_bs, end_date=end_bs,
+                frequency='d', adjustflag='3'
             )
+            bs_rows = []
+            while rs2.error_code == '0' and rs2.next():
+                bs_rows.append(rs2.get_row_data())
 
-            if df is None or len(df) < MIN_TRADE_DAYS:
+            if not bs_rows:
+                if errors <= 3: print(f"  ⚠️ 无数据: {bs_code} err={rs2.error_code} msg={rs2.error_msg}")
+                errors += 1
                 continue
 
-            df = df.sort_values('trade_date')
+            df = pd.DataFrame(bs_rows, columns=['date','close','vol','amount'])
+            df = df[df['close'] != ''].copy()
+            for col in ['close','vol','amount']:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+            df = df.dropna(subset=['close'])
             prices = df['close'].astype(float).values
             current = prices[-1]
 
@@ -369,11 +422,14 @@ def run_selector():
 
             # 只保留高分股票
             if score >= threshold:
+                # P2: 从成分股查询结果提取股票名称
+                name_val = row.get('stock_name', row.get('code_name', bs_code.split('.')[-1]))
                 candidates.append({
-                    'code': ts_code.split('.')[0],
+                    'symbol': ts_code.split('.')[0],
+                    'code':   ts_code.split('.')[0],
                     'ts_code': ts_code,
                     'name': name,
-                    'industry': row.get('industry', ''),
+                    'industry': '其他',
                     'price': round(current, 2),
                     'score': score,
                     'reason': reason,
@@ -386,14 +442,16 @@ def run_selector():
             continue
 
         # 进度显示
-        if (i + 1) % 500 == 0:
+        if (i + 1) % 50 == 0:
             pct = (i + 1) / total * 100
             print(f" 进度: {i+1}/{total} "
                   f"({pct:.0f}%) | "
                   f"候选: {len(candidates)}只 | "
                   f"时间: {datetime.now().strftime('%H:%M:%S')}")
 
-        time.sleep(0.12)  # Tushare 限速
+        time.sleep(0.02)  # BaoStock 无限速，适当间隔
+
+    bs.logout()  # 循环结束，释放连接
 
     # 第四步：排序取前N，行业分散
     print(f"\n【第四步】筛选最优组合...")
@@ -440,28 +498,70 @@ def run_selector():
     except Exception as e:
         print(f'⚠️ 持仓合并失败: {e}')
 
-    # 第六步：保存结果
+    # 第六步：买入前深度审查
+    print("\n【第六步】买入前深度审查...")
+    try:
+        from pre_buy_checker import check_candidates
+        check_results = check_candidates(selected, verbose=True)
+        cr_map = {r['symbol']: r for r in check_results}
+        for s in selected:
+            sym = s.get('symbol', s.get('code', ''))
+            if sym in cr_map:
+                r = cr_map[sym]
+                s['check_score']   = r['score']
+                s['check_verdict'] = r['verdict']
+                s['check_passed']  = r['passed']
+                s['check_reason']  = r['reason']
+        # 推荐买入列表（通过审查的）
+        passed_codes = [r['symbol'] for r in check_results if r['passed']]
+        print(f"\n  ✅ 通过审查: {passed_codes}")
+    except Exception as e:
+        print(f"  ⚠️ 审查模块异常({e})，跳过")
+        passed_codes = watch_codes  # 降级：不过滤
+
+    # 第七步：保存结果
+    # ── final_watch = 通过审查的股票 + 持仓股（始终保留）──
+    final_watch = list(dict.fromkeys(passed_codes)) if passed_codes else []
+
+    # 持仓股始终保留在监控列表首位
+    held = []
+    try:
+        with open('portfolio_state.json') as f:
+            port = json.load(f)
+        held = list(port.get('positions', {}).keys())
+        for code in held:
+            if code not in final_watch:
+                final_watch.insert(0, code)
+    except Exception:
+        pass
+
+    # P1 修复：最终去重，保持顺序
+    final_watch = list(dict.fromkeys(final_watch))
+
+    if not final_watch:
+        print('⚠️ 审查后无股票通过，仅保留持仓监控')
+
     output = {
         'date': datetime.now().strftime('%Y-%m-%d'),
         'updated_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
         'market_regime': regime,
         'market_ret30': round(market_ret * 100, 2),
         'mode': mode_name,
-        'watch_list': watch_codes,
+        'watch_list': final_watch,
+        'passed_list': [c for c in final_watch if c not in held],
         'details': selected
     }
 
-    if not watch_codes:
-        print('⚠️ 选股为空，不覆盖watch_list.json')
-        return []
     with open(WATCH_FILE, 'w', encoding='utf-8') as f:
         json.dump(output, f, ensure_ascii=False, indent=2)
 
     print(f"\n✅ 已保存到 {WATCH_FILE}")
-    print(f"📋 明日监控: {watch_codes}")
+    print(f"📋 明日监控: {final_watch}")
+    print(f"  其中持仓股: {held}")
+    print(f"  新通过审查: {[c for c in final_watch if c not in held]}")
     print(f"{'='*65}")
 
-    return watch_codes
+    return final_watch
 
 
 if __name__ == "__main__":

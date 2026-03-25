@@ -1,0 +1,451 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+A股量化交易系统 v4.2 - 三档置信度模型
+数据层：AKShare（主）+ MomaAPI（备）
+风控层：risk_manager_v2（ATR止损 + 8%硬性止损）
+黑名单：blacklist_manager
+"""
+import sys, os, json, time, logging
+import numpy as np
+from datetime import datetime
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from data_manager import get_realtime_price as _dm_price, get_history_kline as _dm_kline
+
+# 日志
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler("/root/quant-system/logs/trading.log", encoding="utf-8"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# 路径
+BASE_DIR       = os.path.dirname(os.path.abspath(__file__))
+PORTFOLIO_FILE = os.path.join(BASE_DIR, "portfolio_state.json")
+WATCH_LIST_FILE= os.path.join(BASE_DIR, "watch_list.json")
+
+# 风控模块
+try:
+    import blacklist_manager, risk_manager_v2
+    RISK_LOADED = True
+    logger.info("风控模块加载成功")
+except ImportError as e:
+    RISK_LOADED = False
+    logger.warning(f"风控模块加载失败: {e}")
+
+# AKShare
+try:
+    import akshare as ak
+    HAS_AKSHARE = True
+except ImportError:
+    HAS_AKSHARE = False
+    logger.warning("AKShare 未安装")
+
+# 交易参数
+BUY_THRESHOLD  = 75        # 提高买入阈值：75分以上才买（原60）
+SELL_THRESHOLD = 40
+RSI_EXTREME_OVERSOLD   = 20
+RSI_EXTREME_OVERBOUGHT = 80
+POSITION_SIZES = {"HIGH": 0.15, "MEDIUM": 0.08, "LOW": 0.04}
+MAX_POSITIONS  = 5         # 最多同时持仓5只
+MAX_DAILY_BUY  = 1
+_LAST_SIGNAL   = {}  # 信号去重缓存         # 每日最多新增买入1只（防止集中建仓）
+MAX_POSITION_RATIO = 0.80  # 总仓位不超过总资产80%
+MIN_KLINE_REQUIRED = 20    # K线不足时禁止买入
+
+# ══════════════════════════════════════════════════════
+# 持仓管理
+# ══════════════════════════════════════════════════════
+def load_portfolio():
+    with open(PORTFOLIO_FILE, encoding="utf-8") as f:
+        return json.load(f)
+
+def save_portfolio(state):
+    state["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with open(PORTFOLIO_FILE, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+
+def add_position(state, code, shares, price):
+    amount = round(shares * price, 2)
+    if state["cash"] < amount:
+        logger.warning(f"现金不足，无法买入 {code}")
+        return False
+    state["cash"] = round(state["cash"] - amount, 2)
+    state.setdefault("positions", {})[code] = {
+        "shares": shares, "cost": round(price, 3), "current_price": price
+    }
+    state.setdefault("trades", []).append({
+        "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "action": "BUY", "code": code,
+        "shares": shares, "price": price, "amount": amount
+    })
+    save_portfolio(state)
+    logger.info(f"买入 {code}: {shares}股 @ {price}，花费 {amount}")
+    return True
+
+def remove_position(state, code, price, reason="信号卖出"):
+    pos = state.get("positions", {}).get(code)
+    if not pos:
+        return False
+    shares = pos["shares"]
+    cost   = pos["cost"]
+    amount = round(shares * price, 2)
+    pnl    = round((price - cost) * shares, 2)
+    pnl_pct= round((price - cost) / cost * 100, 2)
+    state["cash"] = round(state["cash"] + amount, 2)
+    del state["positions"][code]
+    state.setdefault("trades", []).append({
+        "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "action": "SELL", "code": code,
+        "shares": shares, "price": price,
+        "amount": amount, "pnl": pnl,
+        "pnl_pct": pnl_pct, "reason": reason
+    })
+    save_portfolio(state)
+    emoji = "盈利" if pnl >= 0 else "亏损"
+    logger.info(f"卖出 {code}: {shares}股 @ {price}，{emoji} {pnl}({pnl_pct}%) 原因:{reason}")
+    return True
+
+# ══════════════════════════════════════════════════════
+# 监控列表
+# ══════════════════════════════════════════════════════
+def load_factor_scores():
+    """从watch_list.json读取Qlib因子得分，返回{code: score}字典"""
+    try:
+        if not os.path.exists(WATCH_LIST_FILE):
+            return {}
+        with open(WATCH_LIST_FILE) as f:
+            data = json.load(f)
+        stocks = data.get("stocks", [])
+        scores = {}
+        if stocks:
+            raw_scores = [s.get("score", 0) for s in stocks]
+            max_s = max(raw_scores) if raw_scores else 1
+            min_s = min(raw_scores) if raw_scores else 0
+            rng   = max_s - min_s if max_s != min_s else 1
+            for s in stocks:
+                code = s.get("symbol", "")
+                # 归一化到0-20分区间
+                normalized = (s.get("score", 0) - min_s) / rng * 20
+                scores[code] = round(normalized, 2)
+        return scores
+    except Exception:
+        return {}
+
+# 全局因子得分缓存（每次load_watch_list时刷新）
+_FACTOR_SCORES = {}
+
+def load_watch_list():
+    global _FACTOR_SCORES
+    state   = load_portfolio()
+    held    = list(state.get("positions", {}).keys())
+    default = ["002737", "601116"]
+    if os.path.exists(WATCH_LIST_FILE):
+        with open(WATCH_LIST_FILE) as f:
+            data = json.load(f)
+        raw = data if isinstance(data, list) else data.get("stocks", data.get("watch_list", default))
+        wl = [s["symbol"] if isinstance(s, dict) else s for s in raw]
+    else:
+        wl = default
+    for code in held:
+        if code not in wl:
+            wl.insert(0, code)
+    _FACTOR_SCORES = load_factor_scores()
+    logger.info(f"监控列表: {wl}  因子得分已加载: {len(_FACTOR_SCORES)}只")
+    return wl
+
+# ══════════════════════════════════════════════════════
+# 数据获取
+# ══════════════════════════════════════════════════════
+def get_realtime_price(code):
+    return _dm_price(code)
+
+def get_history_kline(code, days=60):
+    return _dm_kline(code, days)
+
+def calc_rsi(prices, period=14):
+    if len(prices) < period + 1:
+        return 50.0
+    deltas = np.diff(prices[-(period+1):])
+    gains  = np.where(deltas > 0, deltas, 0)
+    losses = np.where(deltas < 0, -deltas, 0)
+    avg_g, avg_l = gains.mean(), losses.mean()
+    if avg_l == 0:
+        return 100.0
+    return round(100 - 100 / (1 + avg_g / avg_l), 1)
+
+def calc_ema(prices, period):
+    if len(prices) < period:
+        return float(prices[-1])
+    k, ema = 2 / (period + 1), float(prices[-period])
+    for p in prices[-period+1:]:
+        ema = p * k + ema * (1 - k)
+    return ema
+
+def calc_macd_diff(prices):
+    if len(prices) < 26:
+        return 0.0
+    return calc_ema(prices, 12) - calc_ema(prices, 26)
+
+def compute_signal(code, prices_list, current_price):
+    prices  = np.array(prices_list, dtype=float)
+    score   = 50.0
+    breakdown     = {}
+    has_conflict  = False
+    conflict_desc = ""
+
+    # RSI
+    rsi = calc_rsi(prices)
+    rsi_extreme = False
+    if rsi <= RSI_EXTREME_OVERSOLD:
+        rs, rd, rsi_extreme = 30, f"RSI={rsi:.0f}极端超卖(+30)", True
+    elif rsi < 35:
+        rs, rd = 25, f"RSI={rsi:.0f}超卖(+25)"
+    elif rsi > RSI_EXTREME_OVERBOUGHT:
+        rs, rd, rsi_extreme = -30, f"RSI={rsi:.0f}极端超买(-30)", True
+    elif rsi > 65:
+        rs, rd = -25, f"RSI={rsi:.0f}超买(-25)"
+    else:
+        rs, rd = 0, f"RSI={rsi:.0f}中性"
+    breakdown["rsi"] = {"score": rs, "desc": rd, "extreme": rsi_extreme}
+    score += rs
+
+    # MACD
+    macd_up = calc_macd_diff(prices) > 0
+    ms = 15 if macd_up else -15
+    md = "MACD金叉(+15)" if macd_up else "MACD死叉(-15)"
+    breakdown["macd"] = {"score": ms, "desc": md}
+    score += ms
+
+    # MA20
+    ma20 = np.mean(prices[-20:]) if len(prices) >= 20 else current_price
+    dev  = (current_price - ma20) / ma20
+    if dev < -0.05:
+        mas, mad = 10, f"低于MA20 {abs(dev)*100:.1f}%(+10)"
+    elif dev > 0.05:
+        mas, mad = -10, f"高于MA20 {dev*100:.1f}%(-10)"
+    else:
+        mas, mad = 0, "价格在MA20附近"
+    breakdown["ma20"] = {"score": mas, "desc": mad}
+    score += mas
+
+    # 矛盾检测
+    rsi_bull = rs > 0
+    rsi_bear = rs < 0
+    if rsi_bull and not macd_up:
+        has_conflict  = True
+        conflict_desc = "RSI极端超卖+MACD死叉→维持8%仓位" if rsi_extreme else "RSI超卖+MACD死叉→降至4%仓位"
+    elif rsi_bear and macd_up:
+        has_conflict  = True
+        conflict_desc = "RSI极端超买+MACD金叉→维持8%仓位" if rsi_extreme else "RSI超买+MACD金叉→降至4%仓位"
+
+    # Qlib因子得分加成（0-20分，动量强的股票获得额外加分）
+    factor_bonus = _FACTOR_SCORES.get(code, 0)
+    if factor_bonus > 0:
+        breakdown["qlib"] = {
+            "score": factor_bonus,
+            "desc":  f"Qlib因子加成+{factor_bonus:.1f}"
+        }
+        score += factor_bonus
+
+    score  = round(max(0, min(100, score)), 1)
+    signal = "BUY" if score >= BUY_THRESHOLD else ("SELL" if score <= SELL_THRESHOLD else "HOLD")
+    tier   = "HIGH" if not has_conflict else ("MEDIUM" if rsi_extreme else "LOW")
+    pos_pct= POSITION_SIZES[tier] if signal != "HOLD" else 0.0
+    reason = " | ".join(v["desc"] for v in breakdown.values() if v.get("score", 0) != 0) or "各因子中性"
+
+    return {
+        "symbol": code, "score": score, "signal": signal,
+        "tier": tier, "position_pct": pos_pct,
+        "has_conflict": has_conflict, "conflict_desc": conflict_desc,
+        "factor_bonus": factor_bonus,
+        "reason": reason
+    }
+
+# ══════════════════════════════════════════════════════
+# 主交易循环
+# ══════════════════════════════════════════════════════
+def get_today_buy_count():
+    """统计今日已买入次数"""
+    today = datetime.now().strftime("%Y-%m-%d")
+    trades = []
+    try:
+        with open(PORTFOLIO_FILE) as f:
+            state = json.load(f)
+        trades = state.get("trades", [])
+    except:
+        pass
+    return sum(1 for t in trades
+               if t.get("action") == "BUY"
+               and t.get("time", "").startswith(today)
+               and t.get("code", t.get("symbol", "")))
+
+def run_cycle(state, watch_list, cycle_num):
+    print(f"\n{chr(61)*60}")
+    print(f"第 {cycle_num} 轮 - {datetime.now().strftime('%H:%M:%S')}")
+    print(chr(61)*60)
+
+    # 实时价格
+    prices = {}
+    for code in watch_list:
+        q = get_realtime_price(code)
+        if q:
+            prices[code] = q
+            if code in state.get("positions", {}):
+                state["positions"][code]["current_price"] = q["price"]
+
+    positions_set = set(state.get("positions", {}).keys())
+    price_changed = [c for c,q in prices.items() if abs(q.get("pct_chg",0))>0.5 or c in positions_set]
+    if price_changed:
+        print("\n实时行情(持仓+变动):")
+        for code in price_changed:
+            q = prices[code]
+            mark = "★" if code in positions_set else " "
+            print(f"  {mark}{code}: {q['price']:.2f} ({q['pct_chg']:+.2f}%) [{q['source']}]")
+
+    # 风控止损（最高优先级）
+    if RISK_LOADED:
+        print("\n风控检查:")
+        alerts = risk_manager_v2.check_all_positions(send_alert=False)
+        for alert in alerts:
+            code = alert["code"]
+            if code in state.get("positions", {}):
+                cur = prices.get(code, {}).get("price", alert["stop_price"])
+                remove_position(state, code, cur, reason="ATR止损触发")
+
+    # 黑名单过滤
+    tradeable = [c for c in watch_list
+                 if not (RISK_LOADED and blacklist_manager.is_blacklisted(c))]
+
+    # 信号分析
+    print("\n信号分析:")
+    signals = {}
+    for code in tradeable:
+        if code not in prices:
+            continue
+        kline = get_history_kline(code, 60)
+        if len(kline) < 20:
+            logger.warning(f"{code} 历史数据不足，跳过")
+            continue
+        sig = compute_signal(code, kline, prices[code]["price"])
+        signals[code] = sig
+        icon = {"BUY": "买入", "SELL": "卖出", "HOLD": "持有"}[sig["signal"]]
+        sig_key = f"{sig['signal']}_{sig['score']}"
+        if _LAST_SIGNAL.get(code) != sig_key:
+            _LAST_SIGNAL[code] = sig_key
+            print(f"  {code} 得分:{sig['score']} -> {icon} {sig['tier']}(仓位{sig['position_pct']*100:.0f}%)")
+            print(f"    {sig['reason']}")
+            if sig["has_conflict"]:
+                print(f"    矛盾: {sig['conflict_desc']}")
+
+    # 交易执行
+    print("\n交易执行:")
+    for code, sig in signals.items():
+        cur     = prices[code]["price"]
+        has_pos = code in state.get("positions", {}) and state["positions"][code]["shares"] > 0
+
+        if sig["signal"] == "BUY" and not has_pos:
+            # ── 三重保护 ──
+            cur_positions = len(state.get("positions", {}))
+            total_assets  = state["cash"] + sum(
+                p["shares"] * prices.get(c, {}).get("price", p["cost"])
+                for c, p in state.get("positions", {}).items()
+            )
+            position_ratio = (total_assets - state["cash"]) / total_assets if total_assets else 0
+
+            # 保护1：持仓数量上限
+            if cur_positions >= MAX_POSITIONS:
+                print(f"  {code}: ⛔ 持仓已达上限{MAX_POSITIONS}只，跳过")
+                continue
+            # 保护1b：每日买入次数限制
+            today_buys = get_today_buy_count()
+            if today_buys >= MAX_DAILY_BUY:
+                print(f"  {code}: ⛔ 今日已买入{today_buys}只，达每日上限{MAX_DAILY_BUY}，跳过")
+                continue
+            # 保护1b：每日买入次数限制
+            # 保护2：总仓位上限
+            if position_ratio >= MAX_POSITION_RATIO:
+                print(f"  {code}: ⛔ 总仓位{position_ratio*100:.0f}%已达上限{MAX_POSITION_RATIO*100:.0f}%，跳过")
+                continue
+            # 保护3：K线数据必须充足（禁止用默认值买入）
+            kline_check = get_history_kline(code, 60)
+            if len(kline_check) < MIN_KLINE_REQUIRED:
+                print(f"  {code}: ⛔ K线数据不足({len(kline_check)}条)，禁止买入")
+                continue
+
+            # 动态仓位：按置信度计算买入股数
+            total_assets_now = state["cash"] + sum(
+                p["shares"] * prices.get(c, {}).get("price", p["cost"])
+                for c, p in state.get("positions", {}).items()
+            )
+            target_value = total_assets_now * sig["position_pct"]
+            raw_shares   = int(target_value / cur / 100) * 100
+            shares_to_buy = max(100, min(raw_shares, 500))
+            print(f"  {code}: {sig["tier"]}置信度 目标仓位{sig["position_pct"]*100:.0f}% 买入{shares_to_buy}股@{cur}")
+            add_position(state, code, shares_to_buy, cur)
+
+        elif sig["signal"] == "BUY" and has_pos:
+            cost = state["positions"][code]["cost"]
+            print(f"  {code}: 已持仓，盈亏{(cur-cost)/cost*100:+.1f}%，跳过")
+        elif sig["signal"] == "SELL" and has_pos:
+            remove_position(state, code, cur, reason="信号卖出")
+        elif sig["signal"] == "HOLD" and has_pos:
+            # 持仓专用卖出规则：浮亏>5% 且 MACD死叉 则减仓
+            cost = state["positions"][code]["cost"]
+            pnl_pct = (cur - cost) / cost * 100
+            macd_bearish = "MACD死叉" in sig.get("reason", "")
+            rsi_overbought = "超买" in sig.get("reason", "")
+            if pnl_pct <= -5.0 and macd_bearish:
+                print(f"  {code}: 持仓亏损{pnl_pct:+.1f}%且MACD死叉，执行保护性卖出")
+                remove_position(state, code, cur, reason="持仓保护-亏损+死叉")
+            elif pnl_pct >= 8.0 and rsi_overbought:
+                print(f"  {code}: 持仓盈利{pnl_pct:+.1f}%且RSI超买，执行止盈")
+                remove_position(state, code, cur, reason="止盈-盈利+超买")
+            else:
+                print(f"  {code}: 持有中 得分{sig['score']} 盈亏{pnl_pct:+.1f}%")
+        else:
+            print(f"  {code}: {'持有中' if has_pos else '无明确信号'}")
+
+    # 持仓汇总
+    print("\n持仓汇总:")
+    total = state["cash"]
+    for code, pos in state.get("positions", {}).items():
+        cur = prices.get(code, {}).get("price", pos["cost"])
+        pnl = (cur - pos["cost"]) / pos["cost"] * 100
+        total += pos["shares"] * cur
+        print(f"  {code}: {pos['shares']}股 成本{pos['cost']:.3f} 现{cur:.2f} ({pnl:+.2f}%)")
+    print(f"  现金: {state['cash']:.2f} | 总资产: {total:.2f}")
+
+def main():
+    print("A股量化交易系统 v4.2 启动")
+    watch_list = load_watch_list()
+    state      = load_portfolio()
+    print(f"监控: {watch_list}")
+
+    cycle = 1
+    while True:
+        now = datetime.now()
+        t   = now.hour * 60 + now.minute
+        if t < 570:
+            print(f"\r等待开盘 {now.strftime('%H:%M:%S')}", end="", flush=True)
+            time.sleep(30)
+            continue
+        if t >= 900:
+            print("\n已到15:00，收盘停止")
+            break
+        try:
+            run_cycle(state, watch_list, cycle)
+        except Exception as e:
+            logger.error(f"交易循环异常: {e}", exc_info=True)
+        print("\n等待下一轮(60秒)...")
+        time.sleep(60)
+        cycle += 1
+    print("\n交易结束")
+
+if __name__ == "__main__":
+    main()

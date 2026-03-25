@@ -20,8 +20,8 @@ class EnhancedRiskManager:
         
         # 第一层：账户级风控
         self.account_config = {
-            "max_position_ratio": 0.80,      # 最大仓位 80%
-            "min_cash_ratio": 0.20,          # 最低现金储备 20%
+            "max_position_ratio": 0.85,      # 最大仓位 85%
+            "min_cash_ratio": 0.15,          # 最低现金储备 15%
             "max_daily_loss": 0.05,          # 单日最大亏损 5%
             "max_drawdown": 0.15,           # 最大回撤 15%
         }
@@ -66,8 +66,11 @@ class EnhancedRiskManager:
     
     # ========== 第一层：账户级风控 ==========
     
-    def check_account_risk(self, total_value: float) -> Dict:
-        """账户级风控检查"""
+    def check_account_risk(self, total_value: float, pos_value: float = None) -> Dict:
+        """账户级风控检查
+        total_value: 总资产
+        pos_value: 持仓市值（可选），不传则从 positions 自动计算
+        """
         result = {
             "level": "account",
             "approved": True,
@@ -75,11 +78,16 @@ class EnhancedRiskManager:
             "warnings": []
         }
         
-        if self.init_capital == 0:
+        if self.init_capital == 0 or total_value == 0:
             return result
         
-        # 计算仓位比例
-        position_ratio = total_value / self.init_capital
+        # 计算仓位比例（持仓市值/总资产）
+        if pos_value is None:
+            pos_value = sum(
+                p.get('shares', 0) * p.get('current_price', p.get('cost', 0))
+                for p in self.positions.values()
+            ) if self.positions else 0
+        position_ratio = pos_value / total_value
         
         # 检查仓位上限
         if position_ratio > self.account_config["max_position_ratio"]:

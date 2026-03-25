@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>量化系统监控面板</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<style>
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#0d1117;color:#e6edf3;margin:0;padding:20px}
+h1{color:#58a6ff;font-size:1.4rem;margin-bottom:20px}
+.card-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:12px;margin-bottom:24px}
+.card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:16px}
+.card .label{font-size:0.75rem;color:#8b949e;text-transform:uppercase;letter-spacing:0.05em}
+.card .value{font-size:1.5rem;font-weight:700;margin-top:4px}
+.card .sub{font-size:0.8rem;color:#8b949e;margin-top:2px}
+.up{color:#3fb950}.down{color:#f85149}.neutral{color:#8b949e}
+table{width:100%;border-collapse:collapse;background:#161b22;border-radius:8px;overflow:hidden}
+th,td{padding:10px 14px;text-align:left;border-bottom:1px solid #30363d}
+th{background:#1c2128;color:#8b949e;font-size:0.75rem;text-transform:uppercase;letter-spacing:0.05em}
+tr:last-child td{border-bottom:none}
+.positive{color:#3fb950}.negative{color:#f85149}
+.chart-container{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:20px;margin-bottom:24px}
+.chart-container h3{color:#e6edf3;margin:0 0 16px;font-size:1rem}
+canvas{max-width:100%}
+</style>
+</head>
+<body>
+<h1>📊 量化系统监控面板</h1>
+
+<div class="card-grid">
+  <div class="card"><div class="label">净值</div><div class="value" id="nav">--</div><div class="sub" id="nav-date"></div></div>
+  <div class="card"><div class="label">总资产</div><div class="value" id="total">--</div><div class="sub" id="cash-sub">现金: --</div></div>
+  <div class="card"><div class="label">持仓浮盈</div><div class="value" id="pnl">--</div><div class="sub" id="pos-sub">持仓: --</div></div>
+  <div class="card"><div class="label">回撤</div><div class="value" id="drawdown">--</div><div class="sub">最大回撤</div></div>
+  <div class="card"><div class="label">胜率</div><div class="value" id="winrate">--</div><div class="sub" id="win-sub">交易: 0胜0负</div></div>
+  <div class="card"><div class="label">夏普比率</div><div class="value" id="sharpe">--</div><div class="sub">年化</div></div>
+</div>
+
+<div class="chart-container">
+  <h3>📈 净值曲线</h3>
+  <canvas id="navChart"></canvas>
+</div>
+
+<div class="card" style="margin-bottom:24px">
+  <h3 style="margin:0 0 12px;color:#e6edf3;font-size:1rem">📦 持仓明细</h3>
+  <table>
+    <thead><tr><th>代码</th><th>股数</th><th>成本</th><th>现价</th><th>浮盈</th></tr></thead>
+    <tbody id="pos-table"><tr><td colspan="5" style="text-align:center;color:#8b949e">加载中...</td></tr></tbody>
+  </table>
+</div>
+
+<script>
+const NAV_INIT = 100_000;
+
+async function loadData() {
+  const [posResp, perfResp] = await Promise.all([
+    fetch('/api/positions'),
+    fetch('/api/performance')
+  ]);
+  const positions = await posResp.json();
+  const perf = (await perfResp.json())[0] || {};
+
+  const cash = positions.cash || 0;
+  const pos = positions.positions || {};
+  let posValue = 0, totalPnl = 0;
+  let rows = '';
+  for (const [code, p] of Object.entries(pos)) {
+    const value = p.shares * (p.current_price || p.cost);
+    const costTotal = p.shares * p.cost;
+    const pnl = value - costTotal;
+    const pnlPct = costTotal > 0 ? (pnl / costTotal * 100) : 0;
+    posValue += value;
+    totalPnl += pnl;
+    const cls = pnl >= 0 ? 'positive' : 'negative';
+    const sign = pnl >= 0 ? '+' : '';
+    rows += `<tr><td>${code}</td><td>${p.shares}</td><td>¥${p.cost.toFixed(2)}</td><td>¥${(p.current_price||p.cost).toFixed(2)}</td><td class="${cls}">${sign}${pnl.toFixed(0)} (${sign}${pnlPct.toFixed(1)}%)</td></tr>`;
+  }
+  if (!rows) rows = '<tr><td colspan="5" style="text-align:center;color:#8b949e">空仓</td></tr>';
+  document.getElementById('pos-table').innerHTML = rows;
+
+  const total = cash + posValue;
+  const nav = total / NAV_INIT;
+  document.getElementById('nav').textContent = nav.toFixed(4);
+  document.getElementById('nav-date').textContent = perf.date || new Date().toISOString().slice(0,10);
+  document.getElementById('total').textContent = '¥' + total.toLocaleString('zh-CN', {minimumFractionDigits:0});
+  document.getElementById('cash-sub').textContent = '现金: ¥' + cash.toLocaleString('zh-CN', {minimumFractionDigits:0});
+  const pnlCls = totalPnl >= 0 ? 'up' : 'down';
+  document.getElementById('pnl').innerHTML = `<span class="${pnlCls}">${totalPnl>=0?'+':''}${totalPnl.toFixed(0)}</span>`;
+  document.getElementById('pos-sub').textContent = '持仓: ¥' + posValue.toLocaleString('zh-CN', {minimumFractionDigits:0});
+
+  const dd = (perf.max_drawdown || 0) * 100;
+  document.getElementById('drawdown').innerHTML = `<span class="down">-${dd.toFixed(1)}%</span>`;
+  document.getElementById('winrate').textContent = ((perf.win_rate || 0) * 100).toFixed(0) + '%';
+  document.getElementById('win-sub').textContent = `交易: ${perf.win_trades||0}胜${perf.lose_trades||0}负`;
+  document.getElementById('sharpe').textContent = (perf.sharpe || 0).toFixed(2);
+}
+
+async function loadNavChart() {
+  const resp = await fetch('/api/nav_history');
+  const data = await resp.json();
+  if (!data.length) return;
+
+  const labels = data.map(d => d.date);
+  const navData = data.map(d => d.nav);
+  const benchNavData = data.map(d => d.benchmark_nav || 1.0);
+
+  const ctx = document.getElementById('navChart').getContext('2d');
+  new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels,
+      datasets: [
+        {
+          label: '系统净值',
+          data: navData,
+          borderColor: '#58a6ff',
+          backgroundColor: 'rgba(88,166,255,0.1)',
+          fill: true,
+          tension: 0.3,
+          pointRadius: 3
+        },
+        {
+          label: '沪深300',
+          data: benchNavData,
+          borderColor: '#8b949e',
+          backgroundColor: 'transparent',
+          borderDash: [5, 5],
+          fill: false,
+          tension: 0.3,
+          pointRadius: 2
+        }
+      ]
+    },
+    options: {
+      responsive: true,
+      interaction: { intersect: false, mode: 'index' },
+      plugins: { legend: { labels: { color: '#e6edf3' } } },
+      scales: {
+        x: { ticks: { color: '#8b949e' }, grid: { color: '#21262d' } },
+        y: { ticks: { color: '#8b949e' }, grid: { color: '#21262d' } }
+      }
+    }
+  });
+}
+
+loadData();
+loadNavChart();
+</script>
+</body>
+</html>

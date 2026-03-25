@@ -1,6 +1,47 @@
-[
-  "603960",
-  "600938",
-  "600329",
-  "002737"
-]
+{
+  "date": "2026-03-26",
+  "updated_at": "2026-03-26 03:16:19",
+  "market_regime": "neutral",
+  "market_ret30": -4.01,
+  "mode": "🐟 震荡市-超卖反弹模式",
+  "watch_list": [
+    "300502",
+    "600089",
+    "300394"
+  ],
+  "passed_list": [],
+  "details": [
+    {
+      "symbol": "600482",
+      "code": "600482",
+      "ts_code": "600482",
+      "name": "中国动力",
+      "industry": "其他",
+      "price": 31.96,
+      "score": 85.0,
+      "reason": "RSI=39.4偏弱(+10) | MACD金叉(+15) | 低于MA20 5%(+10)",
+      "mode": "neutral",
+      "amount": 145036.0,
+      "check_score": 35,
+      "check_verdict": "⚠️ 观望等待",
+      "check_passed": false,
+      "check_reason": "综合评分35/100，信号不够强，建议等待"
+    },
+    {
+      "symbol": "600028",
+      "code": "600028",
+      "ts_code": "600028",
+      "name": "中国石化",
+      "industry": "其他",
+      "price": 5.92,
+      "score": 75.0,
+      "reason": "RSI=16.8极端超卖(+30) | MACD死叉(-15) | 低于MA20 10%(+10)",
+      "mode": "neutral",
+      "amount": 187102.0,
+      "check_score": 0,
+      "check_verdict": "❌ 一票否决",
+      "check_passed": false,
+      "check_reason": "缩量阴跌陷阱(MA死叉+RSI=16.77+量比=0.56)"
+    }
+  ]
+}
