@@ -502,7 +502,9 @@ def run_selector():
     print("\n【第六步】买入前深度审查...")
     try:
         from pre_buy_checker import check_candidates
-        check_results = check_candidates(selected, verbose=True)
+        _thresh = 70 if regime == 'bull' else (55 if regime == 'bear' else 60)
+        print(f'  审查阈值: {_thresh}分（{regime}市）')
+        check_results = check_candidates(selected, verbose=True, threshold=_thresh)
         cr_map = {r['symbol']: r for r in check_results}
         for s in selected:
             sym = s.get('symbol', s.get('code', ''))

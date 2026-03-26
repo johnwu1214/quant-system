@@ -375,7 +375,7 @@ def check_stock(symbol: str, name: str, df: pd.DataFrame) -> dict:
 
 # ── 批量审查入口 ──────────────────────────────────────────
 
-def check_candidates(candidates: list, verbose: bool = True) -> list:
+def check_candidates(candidates: list, verbose: bool = True, threshold: int = 60) -> list:
     """
     批量审查候选股列表
 
